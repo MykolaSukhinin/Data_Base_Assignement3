@@ -1,0 +1,234 @@
+CREATE SCHEMA IF NOT EXISTS prom_raw;
+
+CREATE TABLE IF NOT EXISTS prom_raw.raw_orders AS
+WITH base AS (
+  SELECT
+    -- прості текстові ID, щоб не паритись із INT/UUID, можна потім відредачити як схочете
+    CAST(1487 + i AS STRING) AS order_id,
+    CAST(1 + MOD(i, 67) AS STRING) AS user_id,
+    CAST(1 + MOD(i, 200) AS STRING) AS product_id,
+
+    -- замовлення за останні 30 днів
+    TIMESTAMP_SUB(
+      CURRENT_TIMESTAMP(),
+      INTERVAL CAST(FLOOR(RAND() * 30) AS INT64) DAY
+    ) AS order_timestamp,
+
+    -- кількість товару в замовленні
+    1 + MOD(i, 5) AS quantity,
+
+    -- базова ціна за одиницю (просто рандом у діапазоні 10–39)
+    10 + MOD(i, 30) AS item_price,
+
+    -- знижка іноді є, іноді нє
+    IF(RAND() < 0.25, 2, 0) AS discount_amount,
+
+    -- джерело трафіку
+    ['seo', 'cpc', 'email', 'direct'][
+      OFFSET(CAST(FLOOR(RAND() * 4) AS INT64))
+    ] AS traffic_source,
+
+    -- промокод
+    IF(RAND() < 0.3, 'PROMO10', NULL) AS promo_code,
+
+    -- статус замовлення
+    ['CREATEd','paid','shipped','delivered'][
+      OFFSET(CAST(FLOOR(RAND() * 4) AS INT64))
+    ] AS order_status,
+
+    -- адреса агрегована як хеш + окремі поля міста/району/регіону
+    MD5(CONCAT('addr_', CAST(i AS STRING))) AS address_hash,
+    ['Kyiv','Lviv','Odesa'][
+      OFFSET(CAST(FLOOR(RAND() * 3) AS INT64))
+    ] AS city_name,
+    ['Shevchenkivskyi','Sykhivskyi','Prymorskyi'][
+      OFFSET(CAST(FLOOR(RAND() * 3) AS INT64))
+    ] AS district_name,
+    ['Kyivska','Lvivska','Odeska'][
+      OFFSET(CAST(FLOOR(RAND() * 3) AS INT64))
+    ] AS region
+  FROM UNNEST(GENERATE_ARRAY(1, 670)) AS i   -- 670 рядків
+)
+SELECT * FROM base;
+
+
+-- payments як імітація платіжного сервісу
+CREATE TABLE IF NOT EXISTS prom_raw.raw_payments AS
+WITH base AS (
+  SELECT
+    CAST(5000 + i AS STRING) AS payment_id,
+    o.order_id,
+    o.user_id,
+
+    -- платіж через 0–3 години після часу замовлення
+    TIMESTAMP_ADD(
+      o.order_timestamp,
+      INTERVAL CAST(FLOOR(RAND()*3) AS INT64) HOUR
+    ) AS payment_ts,
+
+    -- сума платежу
+    o.quantity * o.item_price - o.discount_amount AS payment_amount,
+
+    ['card', 'google_pay', 'apple_pay', 'cash_on_delivery'][
+      OFFSET(CAST(FLOOR(RAND()*4) AS INT64))
+    ] AS payment_method,
+
+    ['paid','refunded'][
+      OFFSET(CAST(FLOOR(RAND()*2) AS INT64))
+    ] AS payment_status,
+
+    o.discount_amount AS discount_amount
+  FROM prom_raw.raw_orders AS o
+  JOIN UNNEST(GENERATE_ARRAY(1, 400)) AS i ON TRUE
+  -- Робим реалізм. Не кожне замовлення обов'язково візьметься, потім для цього фільтри будуть
+  WHERE RAND() < 0.8
+)
+SELECT * FROM base;
+
+
+-- сесії користувачів (web / app аналітика)
+CREATE TABLE IF NOT EXISTS prom_raw.raw_sessions AS
+WITH ids AS (
+  SELECT
+    CONCAT('sess_', CAST(i AS STRING)) AS session_id,
+    CAST(1 + MOD(i, 69) AS STRING) AS user_id,
+    TIMESTAMP_SUB(
+      CURRENT_TIMESTAMP(),
+      INTERVAL CAST(FLOOR(RAND() * 30) AS INT64) DAY
+    ) AS session_start_ts
+  FROM UNNEST(GENERATE_ARRAY(1, 400)) AS i
+),
+calc AS (
+  SELECT
+    session_id,
+    user_id,
+    session_start_ts,
+    TIMESTAMP_ADD(
+      session_start_ts,
+      INTERVAL CAST(60 + RAND()*900 AS INT64) SECOND
+    ) AS session_end_ts,
+    CAST(1 + RAND()*10 AS INT64) AS product_views,
+    CAST(RAND() * 3 AS INT64) AS add_to_carts,
+    ['desktop','mobile','tablet'][
+      OFFSET(CAST(FLOOR(RAND() * 3) AS INT64))
+    ] AS device_type
+  FROM ids
+)
+SELECT * FROM calc;
+
+
+-- customers на основі замовлень
+CREATE TABLE IF NOT EXISTS  prom_raw.raw_customers AS
+WITH distinct_users AS (
+  SELECT DISTINCT user_id FROM prom_raw.raw_orders
+),
+users_enriched AS (
+  SELECT
+    user_id,
+    -- реєстрація 60–365 днів тому
+    DATE_SUB(
+      CURRENT_DATE(),
+      INTERVAL CAST(60 + RAND()*300 AS INT64) DAY
+    ) AS registration_date,
+    ['Kyiv','Lviv','Odesa'][
+      OFFSET(CAST(FLOOR(RAND() * 3) AS INT64))
+    ] AS city,
+    ['active','inactive','banned'][
+      OFFSET(CAST(FLOOR(RAND() * 3) AS INT64))
+    ] AS account_status
+  FROM distinct_users
+)
+SELECT * FROM users_enriched;
+
+
+-- products на основі замовлень
+CREATE TABLE IF NOT EXISTS  prom_raw.raw_products AS
+WITH distinct_products AS (
+  SELECT DISTINCT product_id FROM prom_raw.raw_orders
+),
+products_enriched AS (
+  SELECT
+    product_id,
+    CONCAT('m_', CAST(1 + MOD(ABS(FARM_FINGERPRINT(product_id)), 30) AS STRING)) AS merchant_id,
+    CONCAT('Product ', product_id) AS product_name,
+    ['BrandA','BrandB','BrandC'][
+      OFFSET(CAST(FLOOR(RAND() * 3) AS INT64))
+    ] AS brand,
+    -- поточна ціна, яка може трохи відрізнятись від item_price в замовленнях
+    10 + MOD(ABS(FARM_FINGERPRINT(product_id)), 0) AS current_price
+  FROM distinct_products
+)
+SELECT * FROM products_enriched;
+
+
+-- -- -- -- -- -- --
+
+
+CREATE SCHEMA IF NOT EXISTS prom_stage;
+
+-- фільтр під оплачені та доставлені замовлення
+CREATE TABLE IF NOT EXISTS prom_stage.stage_orders AS
+SELECT
+  order_id,
+  user_id,
+  product_id,
+  order_timestamp,
+  quantity,
+  item_price,
+  discount_amount,
+  traffic_source,
+  promo_code,
+  order_status,
+  address_hash,
+  city_name,
+  district_name,
+  region
+FROM prom_raw.raw_orders
+WHERE order_status IN ('paid', 'delivered');
+
+-- фільтр адекватно проведених платежів
+CREATE TABLE IF NOT EXISTS prom_stage.stage_payments AS
+SELECT
+  payment_id,
+  order_id,
+  user_id,
+  payment_ts,
+  payment_amount,
+  payment_method,
+  payment_status,
+  discount_amount
+FROM prom_raw.raw_payments
+WHERE payment_status = 'paid';
+
+-- фільтр битих сессій
+CREATE TABLE IF NOT EXISTS prom_stage.stage_sessions AS
+SELECT
+  session_id,
+  user_id,
+  session_start_ts,
+  session_end_ts,
+  TIMESTAMP_DIFF(session_end_ts, session_start_ts, SECOND) AS session_duration_sec,
+  product_views,
+  add_to_carts,
+  device_type
+FROM prom_raw.raw_sessions
+WHERE session_end_ts > session_start_ts;
+
+-- структура під DIM_CUSTOMER
+CREATE TABLE IF NOT EXISTS prom_stage.stage_customers AS
+SELECT
+  user_id,
+  registration_date,
+  city AS customer_city,
+  account_status
+FROM prom_raw.raw_customers;
+
+-- структура під DIM_PRODUCT
+CREATE TABLE IF NOT EXISTS prom_stage.stage_products AS
+SELECT
+  product_id,
+  merchant_id,
+  product_name,
+  brand,
+  current_price
+FROM prom_raw.raw_products;
